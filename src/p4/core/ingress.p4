@@ -35,6 +35,55 @@ control MyIngress(inout headers hdr,
 		standard_metadata.egress_spec = port;
 	}
 
+	action set_nhop(macAddr_t dst_mac, macAddr_t src_mac, egressSpec_t port) {
+		hdr.ethernet.dstAddr = dst_mac;
+		hdr.ethernet.srcAddr = src_mac;
+		standard_metadata.egress_spec = port;
+		hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
+	}
+
+	action send_arp_reply(macAddr_t router_mac, ip4Addr_t router_ip) {
+		macAddr_t requester_mac = hdr.arp.sha;
+		ip4Addr_t requester_ip = hdr.arp.spa;
+
+		hdr.ethernet.dstAddr = requester_mac;
+		hdr.ethernet.srcAddr = router_mac;
+		hdr.ethernet.etherType = TYPE_ARP;
+
+		hdr.arp.oper = ARP_OPER_REPLY;
+		hdr.arp.sha = router_mac;
+		hdr.arp.spa = router_ip;
+		hdr.arp.tha = requester_mac;
+		hdr.arp.tpa = requester_ip;
+
+		standard_metadata.egress_spec = standard_metadata.ingress_port;
+	}
+
+	table arp_router_reply {
+		key = {
+			hdr.arp.tpa: exact;
+			standard_metadata.ingress_port: exact;
+		}
+		actions = {
+			send_arp_reply;
+			drop;
+		}
+		size = 256;
+		default_action = drop();
+	}
+
+	table ipv4_lpm {
+		key = {
+			hdr.ipv4.dstAddr: lpm;
+		}
+		actions = {
+			set_nhop;
+			NoAction;
+		}
+		size = 4096;
+		default_action = NoAction;
+	}
+
 
 	/* Simple l2 forwarding logic */
 	table l2_forward {
@@ -163,7 +212,7 @@ control MyIngress(inout headers hdr,
 
 		bit<8> shift_pos = 0;
 		if (valid_stages_num != 0) {
-			shift_pos = 64 << (valid_stages_num - 1);
+			shift_pos = (bit<8>)64 << (valid_stages_num - 1);
 		}
 
 		hdr.netcache.value = (bit<NETCACHE_VALUE_WIDTH_MAX>) hdr.netcache.value << 64;
@@ -178,7 +227,7 @@ control MyIngress(inout headers hdr,
 
 		bit<8> shift_pos = 0;
 		if (valid_stages_num != 0) {
-			shift_pos = 64 << (valid_stages_num - 1);
+			shift_pos = (bit<8>)64 << (valid_stages_num - 1);
 		}
 
 		hdr.netcache.value = (bit<NETCACHE_VALUE_WIDTH_MAX>) hdr.netcache.value << 64;
@@ -193,7 +242,7 @@ control MyIngress(inout headers hdr,
 
 		bit<8> shift_pos = 0;
 		if (valid_stages_num != 0) {
-			shift_pos = 64 << (valid_stages_num - 1);
+			shift_pos = (bit<8>)64 << (valid_stages_num - 1);
 		}
 
 		hdr.netcache.value = (bit<NETCACHE_VALUE_WIDTH_MAX>) hdr.netcache.value << 64;
@@ -208,7 +257,7 @@ control MyIngress(inout headers hdr,
 
 		bit<8> shift_pos = 0;
 		if (valid_stages_num != 0) {
-			shift_pos = 64 << (valid_stages_num - 1);
+			shift_pos = (bit<8>)64 << (valid_stages_num - 1);
 		}
 
 		hdr.netcache.value = (bit<NETCACHE_VALUE_WIDTH_MAX>) hdr.netcache.value << 64;
@@ -223,7 +272,7 @@ control MyIngress(inout headers hdr,
 
 		bit<8> shift_pos = 0;
 		if (valid_stages_num != 0) {
-			shift_pos = 64 << (valid_stages_num - 1);
+			shift_pos = (bit<8>)64 << (valid_stages_num - 1);
 		}
 
 		hdr.netcache.value = (bit<NETCACHE_VALUE_WIDTH_MAX>) hdr.netcache.value << 64;
@@ -238,7 +287,7 @@ control MyIngress(inout headers hdr,
 
 		bit<8> shift_pos = 0;
 		if (valid_stages_num != 0) {
-			shift_pos = 64 << (valid_stages_num - 1);
+			shift_pos = (bit<8>)64 << (valid_stages_num - 1);
 		}
 
 		hdr.netcache.value = (bit<NETCACHE_VALUE_WIDTH_MAX>) hdr.netcache.value << 64;
@@ -253,7 +302,7 @@ control MyIngress(inout headers hdr,
 
 		bit<8> shift_pos = 0;
 		if (valid_stages_num != 0) {
-			shift_pos = 64 << (valid_stages_num - 1);
+			shift_pos = (bit<8>)64 << (valid_stages_num - 1);
 		}
 
 		hdr.netcache.value = (bit<NETCACHE_VALUE_WIDTH_MAX>) hdr.netcache.value << 64;
@@ -362,6 +411,19 @@ control MyIngress(inout headers hdr,
 
 
 	apply {
+
+		if (hdr.arp.isValid()) {
+			if (hdr.arp.oper == ARP_OPER_REQUEST &&
+				hdr.arp.htype == ARP_HTYPE_ETHERNET &&
+				hdr.arp.ptype == ARP_PTYPE_IPV4 &&
+				hdr.arp.hlen == ARP_HLEN_ETHERNET &&
+				hdr.arp.plen == ARP_PLEN_IPV4) {
+				arp_router_reply.apply();
+			} else {
+				drop();
+			}
+			return;
+		}
 
 		if (hdr.netcache.isValid()) {
 
@@ -526,7 +588,15 @@ control MyIngress(inout headers hdr,
 
         }
 
-		l2_forward.apply();
+		if (hdr.ipv4.isValid()) {
+			if (hdr.ipv4.version != 4 || hdr.ipv4.ihl < 5 || hdr.ipv4.ttl <= 1) {
+				drop();
+			} else if (!ipv4_lpm.apply().hit) {
+				l2_forward.apply();
+			}
+		} else {
+			l2_forward.apply();
+		}
 	}
 
 }

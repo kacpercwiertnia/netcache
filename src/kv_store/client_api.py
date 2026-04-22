@@ -1,6 +1,7 @@
 import socket
 import time
 import sys
+import os
 
 NETCACHE_PORT = 50000
 NOCACHE_PORT = 50001
@@ -65,6 +66,12 @@ class NetCacheClient:
         if self.n_servers > MAX_SUPPORTED_SERVERS:
             print("Error: Exceeded maximum supported servers")
             sys.exit()
+
+        servers_env = os.environ.get("NETCACHE_SERVER_IPS")
+        if servers_env:
+            self.servers = [server.strip() for server in servers_env.split(",") if server.strip()]
+            self.n_servers = len(self.servers)
+            return
 
         for i in range(self.n_servers):
             self.servers.append("10.0.0." + str(i+1));

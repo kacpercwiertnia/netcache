@@ -1,7 +1,9 @@
-from p4utils.utils.topology import Topology
-from p4utils.utils.sswitch_API import SimpleSwitchAPI
+from p4utils.utils.sswitch_thrift_API import SimpleSwitchThriftAPI
 from scapy.all import sniff, Packet, Ether, IP, UDP, TCP, BitField, Raw
 from crc import Crc
+import argparse
+import json
+import os
 
 import threading
 import struct
@@ -44,6 +46,58 @@ crc32_polinomials = [0x04C11DB7, 0xEDB88320, 0xDB710641, 0x82608EDB,
                      0x32583499, 0x992C1A4C, 0x32583499, 0x992C1A4C]
 
 
+
+class CompatTopology:
+    def __init__(self, db):
+        with open(db) as f:
+            self.data = json.load(f)
+        if isinstance(self.data, dict) and "nodes" in self.data:
+            self.format = "node_link"
+            self.nodes = {node["id"]: node for node in self.data.get("nodes", [])}
+            self.links = self.data.get("links", [])
+        else:
+            self.format = "p4utils_dict"
+            self.nodes = self.data
+            self.links = []
+
+    def get_thrift_port(self, name):
+        return self.nodes[name]["thrift_port"]
+
+    def get_cpu_port_index(self, name):
+        return self.nodes[name].get("cpu_port_num")
+
+    def get_hosts_connected_to(self, switch):
+        if self.format == "p4utils_dict":
+            return [
+                peer
+                for peer in self.nodes[switch].get("interfaces_to_node", {}).values()
+                if self.nodes.get(peer, {}).get("type") == "host"
+            ]
+        hosts = []
+        for link in self.links:
+            if link["node1"] == switch and self.nodes.get(link["node2"], {}).get("isHost"):
+                hosts.append(link["node2"])
+            elif link["node2"] == switch and self.nodes.get(link["node1"], {}).get("isHost"):
+                hosts.append(link["node1"])
+        return hosts
+
+    def node_to_node_port_num(self, node, peer):
+        if self.format == "p4utils_dict":
+            return self.nodes[node][peer]["port"]
+        for link in self.links:
+            if link["node1"] == node and link["node2"] == peer:
+                return link["port1"]
+            if link["node2"] == node and link["node1"] == peer:
+                return link["port2"]
+        raise KeyError((node, peer))
+
+    def get_host_mac(self, host):
+        return self.nodes[host]["mac"]
+
+    def get_cpu_port_intf(self, switch):
+        return self.nodes[switch].get("cpu_intf")
+
+
 class NetcacheHeader(Packet):
     name = 'NcachePacket'
     fields_desc = [BitField('op', 0, 8), BitField('seq', 0, 32),
@@ -52,12 +106,13 @@ class NetcacheHeader(Packet):
 
 class NCacheController(object):
 
-    def __init__(self, sw_name, vtables_num=8):
-        self.topo = Topology(db="../p4/topology.db")
+    def __init__(self, sw_name, vtables_num=8, topology_db="../p4/topology.json", sniff_hot_reports=True):
+        self.topo = CompatTopology(db=topology_db)
         self.sw_name = sw_name
         self.thrift_port = self.topo.get_thrift_port(self.sw_name)
         self.cpu_port = self.topo.get_cpu_port_index(self.sw_name)
-        self.controller = SimpleSwitchAPI(self.thrift_port)
+        self.sniff_hot_reports = sniff_hot_reports
+        self.controller = SimpleSwitchThriftAPI(self.thrift_port)
 
         self.custom_calcs = self.controller.get_custom_crc_calcs()
         self.sketch_register_num = len(self.custom_calcs)
@@ -69,7 +124,7 @@ class NCacheController(object):
         # create a pool of ids (as much as the total amount of keys)
         # this pool will be used to assign index to keys which will be
         # used to index the cached key counter and the validity register
-        self.ids_pool = range(0, VTABLE_ENTRIES * VTABLE_SLOT_SIZE);
+        self.ids_pool = list(range(0, VTABLE_ENTRIES * VTABLE_SLOT_SIZE));
 
         # array of bitmap, which marks available slots per cache line
         # as 0 bits and occupied slots as 1 bits
@@ -327,7 +382,7 @@ class NCacheController(object):
     # (seems hacky due to restriction to use python2.7)
     def str_to_int(self, x, int_width=VTABLE_SLOT_SIZE):
         if len(x) > int_width:
-            print "Error: Overflow while converting string to int"
+            print("Error: Overflow while converting string to int")
 
         # add padding with 0x00 if input string size less than int_width
         bytearr = bytearray(int_width - len(x))
@@ -461,6 +516,9 @@ class NCacheController(object):
     # packet is captured, handle the packet via a callback to recv_switch_updates function
     def hot_reports_loop(self):
         cpu_port_intf = str(self.topo.get_cpu_port_intf(self.sw_name))
+        if cpu_port_intf in ("None", ""):
+            print("No CPU port interface configured; skipping hot reports sniff loop")
+            return
         sniff(iface=cpu_port_intf, prn=self.recv_switch_updates, filter="port 50000")
 
 
@@ -468,8 +526,18 @@ class NCacheController(object):
         self.set_forwarding_table()
         self.set_value_tables()
         self.dummy_populate_vtables()
-        self.hot_reports_loop()
+        if self.sniff_hot_reports:
+            self.hot_reports_loop()
 
 
 if __name__ == "__main__":
-    controller = NCacheController('s1').main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--switch-name", default=os.environ.get("NETCACHE_SWITCH_NAME", "s1"))
+    parser.add_argument("--topology-db", default=os.environ.get("NETCACHE_TOPOLOGY_DB", "../p4/topology.json"))
+    parser.add_argument("--no-sniff", action="store_true")
+    args = parser.parse_args()
+    controller = NCacheController(
+        args.switch_name,
+        topology_db=args.topology_db,
+        sniff_hot_reports=not args.no_sniff,
+    ).main()

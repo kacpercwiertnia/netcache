@@ -395,17 +395,21 @@ class KVServer:
 
 
 
-def main(disable_cache, suppress_output, input_files):
+def main(disable_cache, suppress_output, input_files, host=None, port=None):
 
     from subprocess import check_output
 
     # dynamically get the IP address of the server
-    server_ip = check_output(['hostname', '--all-ip-addresses']).decode('utf-8').rstrip()
+    server_ip = host
+    if server_ip is None:
+        server_ip = check_output(['hostname', '--all-ip-addresses']).decode('utf-8').split()[0]
     server = KVServer(server_ip, nocache=disable_cache, suppress=suppress_output)
+    if port is not None:
+        server.port = port
 
     # populate the server with all the files given as command line
     # arguments (Usage: python3 server.py [file1 file2 ...])
-    for data_file in input_files:
+    for data_file in input_files or []:
         server.populate_from_file(data_file)
 
     server.activate()
@@ -418,7 +422,9 @@ if __name__ == "__main__":
 
     parser.add_argument('--disable-cache', help='do not use netcache', action='store_true')
     parser.add_argument('--suppress-output', help='supress output printing messages', action='store_true')
+    parser.add_argument('--host', help='address to bind the server sockets to', required=False)
+    parser.add_argument('--port', help='port to bind the server sockets to', required=False, type=int)
     parser.add_argument('--input', help='input files to prepopulate server', required=False, nargs="*")
     args = parser.parse_args()
 
-    main(args.disable_cache, args.suppress_output, args.input)
+    main(args.disable_cache, args.suppress_output, args.input, args.host, args.port)

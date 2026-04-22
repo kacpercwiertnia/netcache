@@ -31,8 +31,16 @@
 /* special reserved port for NetCache */
 const bit<16> NETCACHE_PORT = 50000;
 const bit<16> TYPE_IPV4 = 0x800;
+const bit<16> TYPE_ARP = 0x0806;
 const bit<8> TYPE_TCP = 0x06;
 const bit<8> TYPE_UDP = 0x11;
+
+const bit<16> ARP_HTYPE_ETHERNET = 1;
+const bit<16> ARP_PTYPE_IPV4 = 0x0800;
+const bit<8> ARP_HLEN_ETHERNET = 6;
+const bit<8> ARP_PLEN_IPV4 = 4;
+const bit<16> ARP_OPER_REQUEST = 1;
+const bit<16> ARP_OPER_REPLY = 2;
 
 /* current query supported types */
 const bit<8> READ_QUERY = 0x00;
@@ -76,6 +84,18 @@ header ipv4_t {
     bit<16>   hdrChecksum;
     ip4Addr_t srcAddr;
     ip4Addr_t dstAddr;
+}
+
+header arp_t {
+    bit<16> htype;
+    bit<16> ptype;
+    bit<8>  hlen;
+    bit<8>  plen;
+    bit<16> oper;
+    macAddr_t sha;
+    ip4Addr_t spa;
+    macAddr_t tha;
+    ip4Addr_t tpa;
 }
 
 header tcp_t{
@@ -192,6 +212,7 @@ struct metadata {
 
 struct headers {
     ethernet_t   ethernet;
+    arp_t        arp;
     ipv4_t       ipv4;
     tcp_t        tcp;
 	tcp_options_t tcp_options;
