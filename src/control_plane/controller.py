@@ -4,6 +4,10 @@ from crc import Crc
 import argparse
 import json
 import os
+import re
+import subprocess
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import threading
 import struct
@@ -17,6 +21,9 @@ NETCACHE_LOOKUP_TABLE = "lookup_table"
 SKETCH_REG_PREFIX = "sketch"
 BLOOMF_REG_PREFIX = "bloom"
 CACHED_KEYS_COUNTER = "query_freq_cnt"
+NETCACHE_HIT_COUNTER = "cache_hit_cnt"
+NETCACHE_MISS_COUNTER = "cache_miss_cnt"
+NETCACHE_COUNTER_PREFIXES = ["MyIngress.", "MyEgress."]
 
 
 BLOOMF_REGISTERS_NUM = 3
@@ -106,12 +113,24 @@ class NetcacheHeader(Packet):
 
 class NCacheController(object):
 
-    def __init__(self, sw_name, vtables_num=8, topology_db="../p4/topology.json", sniff_hot_reports=True):
+    def __init__(
+            self,
+            sw_name,
+            vtables_num=8,
+            topology_db="../p4/topology.json",
+            sniff_hot_reports=True,
+            populate_dummy=False,
+            api_listen=None,
+            api_port=18080):
         self.topo = CompatTopology(db=topology_db)
         self.sw_name = sw_name
         self.thrift_port = self.topo.get_thrift_port(self.sw_name)
         self.cpu_port = self.topo.get_cpu_port_index(self.sw_name)
         self.sniff_hot_reports = sniff_hot_reports
+        self.populate_dummy = populate_dummy
+        self.api_listen = api_listen
+        self.api_port = api_port
+        self.lock = threading.RLock()
         self.controller = SimpleSwitchThriftAPI(self.thrift_port)
 
         self.custom_calcs = self.controller.get_custom_crc_calcs()
@@ -271,7 +290,7 @@ class NCacheController(object):
     # Memory Management section of 4.4.2 (netcache paper)
     def first_fit(self, key, value_size):
 
-        n_slots = (value_size / (VTABLE_SLOT_SIZE + 1)) + 1
+        n_slots = int((value_size + VTABLE_SLOT_SIZE - 1) / VTABLE_SLOT_SIZE)
         if value_size <= 0:
             return None
         if key in self.key_map:
@@ -332,49 +351,67 @@ class NCacheController(object):
     # the switch and we also update the value registers with the value
     # given as argument (stored in multiple slots)
     def insert(self, key, value, cont=True):
+        if len(key) > 8:
+            return {"ok": False, "reason": "KeyTooLong", "key": key}
+        if len(value) > 64:
+            return {"ok": False, "reason": "ValueTooLong", "key": key}
+
         # find where to put the value for given key
-        mem_info = self.first_fit(key, len(value))
+        with self.lock:
+            mem_info = self.first_fit(key, len(value))
 
-        # if key already exists or not space available then stop
-        if mem_info == None:
-            return
+            # if key already exists or not space available then stop
+            if mem_info == None:
+                reason = "AlreadyExists" if key in self.key_map else "NoSpace"
+                return {"ok": False, "reason": reason, "key": key}
 
-        vt_index, bitmap = mem_info
+            vt_index, bitmap = mem_info
 
-        # keep track of number of bytes of the value written so far
-        cnt = 0
+            # keep track of number of bytes of the value written so far
+            cnt = 0
 
-        # store the value of the key in the vtables of the switch while
-        # incrementally storing a part of the value at each value table
-        # if the correspoding bit of the bitmap is set
-        for i in range(self.vtables_num):
+            # store the value of the key in the vtables of the switch while
+            # incrementally storing a part of the value at each value table
+            # if the correspoding bit of the bitmap is set
+            for i in range(self.vtables_num):
 
-            if self.bit_is_set(bitmap, self.vtables_num - i - 1):
-                partial_val = value[cnt:cnt+VTABLE_SLOT_SIZE]
-                self.controller.register_write(VTABLE_NAME_PREFIX + str(i),
-                        vt_index, self.str_to_int(partial_val))
+                if self.bit_is_set(bitmap, self.vtables_num - i - 1):
+                    partial_val = value[cnt:cnt+VTABLE_SLOT_SIZE]
+                    self.controller.register_write(VTABLE_NAME_PREFIX + str(i),
+                            vt_index, self.str_to_int(partial_val))
 
-                cnt += VTABLE_SLOT_SIZE
+                    cnt += VTABLE_SLOT_SIZE
 
-        # allocate an id from the pool to index the counter and validity register
-        # (we take the last element of list because in python list is implemented
-        # to optimize for inserting and removing elements from the end of the list)
-        key_index = self.ids_pool.pop()
+            # allocate an id from the pool to index the counter and validity register
+            # (we take the last element of list because in python list is implemented
+            # to optimize for inserting and removing elements from the end of the list)
+            key_index = self.ids_pool.pop()
 
-        # add the new key to the cache lookup table of the p4 switch
-        self.controller.table_add(NETCACHE_LOOKUP_TABLE, "set_lookup_metadata",
-            [str(self.str_to_int(key))], [str(bitmap), str(vt_index), str(key_index)])
+            # add the new key to the cache lookup table of the p4 switch
+            self.controller.table_add(NETCACHE_LOOKUP_TABLE, "set_lookup_metadata",
+                [str(self.str_to_int(key))], [str(bitmap), str(vt_index), str(key_index)])
 
-        # mark cache entry for this key as valid
-        self.controller.register_write("cache_status", key_index, 1)
+            # mark cache entry for this key as valid
+            self.controller.register_write("cache_status", key_index, 1)
 
-        self.key_map[key] = vt_index, bitmap, key_index
+            self.key_map[key] = vt_index, bitmap, key_index
 
-        # inform the server about the successful cache insertion
-        if cont:
-            self.inform_server()
+            inserted_slots = bin(bitmap).count("1")
 
-        print("Inserted key-value pair to cache: ("+key+","+value+")")
+            # inform the server about the successful cache insertion
+            if cont:
+                self.inform_server()
+
+            print("Inserted key-value pair to cache: ("+key+","+value+")")
+            return {
+                "ok": True,
+                "key": key,
+                "valueSize": len(value),
+                "slots": inserted_slots,
+                "vtableIndex": vt_index,
+                "bitmap": bitmap,
+                "keyIndex": key_index,
+            }
 
 
     # converts a string to a bytes representation and afterwards returns
@@ -424,9 +461,10 @@ class NCacheController(object):
         if key not in self.key_map:
             return
 
-        # update key-value pair by removing old pair and inserting new one
-        self.evict(key)
-        self.insert(key, value)
+        with self.lock:
+            # update key-value pair by removing old pair and inserting new one
+            self.evict(key)
+            return self.insert(key, value)
 
 
     # evict given key from the cache by deleting its associated entries in
@@ -434,30 +472,31 @@ class NCacheController(object):
     # marking the cache entry as valid once the deletion is completed
     def evict(self, key):
 
-        if key not in self.key_map:
-            return
+        with self.lock:
+            if key not in self.key_map:
+                return
 
-        # delete entry from the lookup_table
-        entry_handle = self.controller.get_handle_from_match(
-                NETCACHE_LOOKUP_TABLE, [str(self.str_to_int(key)), ])
+            # delete entry from the lookup_table
+            entry_handle = self.controller.get_handle_from_match(
+                    NETCACHE_LOOKUP_TABLE, [str(self.str_to_int(key)), ])
 
-        if entry_handle is not None:
-            self.controller.table_delete(NETCACHE_LOOKUP_TABLE, entry_handle)
+            if entry_handle is not None:
+                self.controller.table_delete(NETCACHE_LOOKUP_TABLE, entry_handle)
 
-        # delete mapping of key from controller's dictionary
-        vt_idx, bitmap, key_idx = self.key_map[key]
-        del self.key_map[key]
+            # delete mapping of key from controller's dictionary
+            vt_idx, bitmap, key_idx = self.key_map[key]
+            del self.key_map[key]
 
-        # deallocate space from memory pool
-        self.mem_pool[vt_idx] = self.mem_pool[vt_idx] ^ bitmap
-        self.used_mem_slots = self.used_mem_slots - bin(bitmap).count("1")
+            # deallocate space from memory pool
+            self.mem_pool[vt_idx] = self.mem_pool[vt_idx] ^ bitmap
+            self.used_mem_slots = self.used_mem_slots - bin(bitmap).count("1")
 
-        # free the id used to index the validity/counter register and append
-        # it back to the id pool of the controller
-        self.ids_pool.append(key_idx)
+            # free the id used to index the validity/counter register and append
+            # it back to the id pool of the controller
+            self.ids_pool.append(key_idx)
 
-        # mark cache entry as valid again (should be the last thing to do)
-        self.controller.register_write("cache_status", key_idx, 1)
+            # mark cache entry as valid again (should be the last thing to do)
+            self.controller.register_write("cache_status", key_idx, 1)
 
 
 
@@ -521,13 +560,180 @@ class NCacheController(object):
             return
         sniff(iface=cpu_port_intf, prn=self.recv_switch_updates, filter="port 50000")
 
+    def cache_status(self):
+        with self.lock:
+            capacity_entries = len(self.mem_pool)
+            capacity_slots = len(self.mem_pool) * self.vtables_num
+            used_entries = len(self.key_map)
+            used_slots = self.used_mem_slots
+            return {
+                "switchName": self.sw_name,
+                "capacityEntries": capacity_entries,
+                "usedEntries": used_entries,
+                "freeEntries": max(0, capacity_entries - used_entries),
+                "capacitySlots": capacity_slots,
+                "usedSlots": used_slots,
+                "freeSlots": max(0, capacity_slots - used_slots),
+                "keys": sorted(self.key_map.keys()),
+            }
+
+    def device_metrics(self):
+        per_port_packets = {}
+        per_port_bytes = {}
+        packets_processed = 0
+        bytes_processed = 0
+        for iface in sorted(os.listdir("/sys/class/net")):
+            if iface == "lo" or iface.startswith("eth0"):
+                continue
+            stats_dir = os.path.join("/sys/class/net", iface, "statistics")
+            try:
+                with open(os.path.join(stats_dir, "rx_packets"), "r", encoding="utf-8") as handle:
+                    packets = int(handle.read().strip())
+                with open(os.path.join(stats_dir, "rx_bytes"), "r", encoding="utf-8") as handle:
+                    byte_count = int(handle.read().strip())
+            except (FileNotFoundError, ValueError):
+                continue
+            per_port_packets[iface] = packets
+            per_port_bytes[iface] = byte_count
+            packets_processed += packets
+            bytes_processed += byte_count
+        cache_hits = self._counter_packets(NETCACHE_HIT_COUNTER, 0)
+        cache_misses = self._counter_packets(NETCACHE_MISS_COUNTER, 0)
+        cache_queries = cache_hits + cache_misses
+        return {
+            "collectedAtEpochSeconds": time.time(),
+            "packetsProcessed": packets_processed,
+            "bytesProcessed": bytes_processed,
+            "cacheHits": cache_hits,
+            "cacheMisses": cache_misses,
+            "cacheHitRatio": cache_hits / cache_queries if cache_queries else 0.0,
+            "cacheMissRatio": cache_misses / cache_queries if cache_queries else 0.0,
+            "perPortPackets": per_port_packets,
+            "perPortBytes": per_port_bytes,
+        }
+
+    def _counter_packets(self, counter_name, index):
+        counter_names = [counter_name]
+        if "." not in counter_name:
+            counter_names.extend(prefix + counter_name for prefix in NETCACHE_COUNTER_PREFIXES)
+        last_error = None
+        for candidate in counter_names:
+            try:
+                return self._counter_packets_cli(candidate, index)
+            except BaseException as err:
+                last_error = err
+            try:
+                value = self.controller.counter_read(candidate, index)
+                return int(getattr(value, "packets", value or 0))
+            except BaseException as err:
+                last_error = err
+        print("[WARN]: Unable to read counter {}[{}]: {}".format(counter_name, index, last_error), flush=True)
+        return 0
+
+    def _counter_packets_cli(self, counter_name, index):
+        command = "counter_read {} {}\n".format(counter_name, index)
+        result = subprocess.run(
+            ["simple_switch_CLI_wrapped", "--thrift-port", str(self.thrift_port)],
+            input=command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+            check=False,
+        )
+        output = result.stdout + "\n" + result.stderr
+        if result.returncode != 0:
+            raise RuntimeError(output.strip())
+        match = re.search(r"{}\[{}\]=\s*\(\d+ bytes, (\d+) packets\)".format(re.escape(counter_name), index), output)
+        if not match:
+            raise RuntimeError(output.strip())
+        return int(match.group(1))
+
+    def serve_api(self):
+        controller = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def _send_json(self, code, payload):
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _read_json(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                if length == 0:
+                    return {}
+                return json.loads(self.rfile.read(length).decode("utf-8"))
+
+            def do_GET(self):
+                try:
+                    if self.path in ("/healthz", "/readyz"):
+                        self._send_json(200, {"ok": True})
+                        return
+                    if self.path == "/status":
+                        self._send_json(200, controller.cache_status())
+                        return
+                    if self.path == "/metrics":
+                        self._send_json(200, controller.device_metrics())
+                        return
+                    self._send_json(404, {"error": "NotFound"})
+                except BaseException as err:
+                    print("[ERROR]: API GET {} failed: {}".format(self.path, err), flush=True)
+                    self._send_json(500, {"error": type(err).__name__, "message": str(err)})
+
+            def do_POST(self):
+                try:
+                    if self.path != "/cache/entries":
+                        self._send_json(404, {"error": "NotFound"})
+                        return
+
+                    payload = self._read_json()
+                    entries = payload.get("entries")
+                    if entries is None:
+                        entries = [{"key": payload.get("key"), "value": payload.get("value")}]
+
+                    results = []
+                    inserted = 0
+                    for entry in entries:
+                        key = str(entry.get("key", ""))
+                        value = str(entry.get("value", ""))
+                        result = controller.insert(key, value, cont=False)
+                        results.append(result)
+                        if result.get("ok"):
+                            inserted += 1
+
+                    self._send_json(200, {
+                        "inserted": inserted,
+                        "results": results,
+                        "status": controller.cache_status(),
+                    })
+                except BaseException as err:
+                    print("[ERROR]: API POST {} failed: {}".format(self.path, err), flush=True)
+                    self._send_json(500, {"error": type(err).__name__, "message": str(err)})
+
+            def log_message(self, fmt, *args):
+                print("[api] " + fmt % args)
+
+        httpd = ThreadingHTTPServer((self.api_listen, self.api_port), Handler)
+        print("[INFO]: NetCache control API listening on %s:%s" % (self.api_listen, self.api_port))
+        httpd.serve_forever()
 
     def main(self):
         self.set_forwarding_table()
         self.set_value_tables()
-        self.dummy_populate_vtables()
+        if self.populate_dummy:
+            self.dummy_populate_vtables()
+        if self.api_listen:
+            api_t = threading.Thread(target=self.serve_api)
+            api_t.daemon = True
+            api_t.start()
         if self.sniff_hot_reports:
             self.hot_reports_loop()
+        if self.api_listen:
+            while True:
+                threading.Event().wait(3600)
 
 
 if __name__ == "__main__":
@@ -535,9 +741,19 @@ if __name__ == "__main__":
     parser.add_argument("--switch-name", default=os.environ.get("NETCACHE_SWITCH_NAME", "s1"))
     parser.add_argument("--topology-db", default=os.environ.get("NETCACHE_TOPOLOGY_DB", "../p4/topology.json"))
     parser.add_argument("--no-sniff", action="store_true")
+    parser.add_argument("--api-listen", default=os.environ.get("NETCACHE_API_LISTEN"))
+    parser.add_argument("--api-port", type=int, default=int(os.environ.get("NETCACHE_API_PORT", "18080")))
+    parser.add_argument(
+        "--populate-dummy",
+        action="store_true",
+        default=os.environ.get("NETCACHE_POPULATE_DUMMY", "").lower() in ("1", "true", "yes", "on"),
+    )
     args = parser.parse_args()
     controller = NCacheController(
         args.switch_name,
         topology_db=args.topology_db,
         sniff_hot_reports=not args.no_sniff,
+        populate_dummy=args.populate_dummy,
+        api_listen=args.api_listen,
+        api_port=args.api_port,
     ).main()

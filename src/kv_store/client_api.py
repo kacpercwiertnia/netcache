@@ -42,9 +42,12 @@ def build_message(op, key, seq=0, value = ""):
 
 class NetCacheClient:
 
-    def __init__(self, n_servers=1, no_cache=False):
+    def __init__(self, n_servers=1, no_cache=False, timeout=None):
         self.n_servers = n_servers
         self.servers = []
+        if timeout is None:
+            timeout = float(os.environ.get("NETCACHE_CLIENT_TIMEOUT_SECONDS", "10"))
+        self.timeout = timeout
 
         if no_cache:
             self.port = NOCACHE_PORT
@@ -52,6 +55,7 @@ class NetCacheClient:
             self.port = NETCACHE_PORT
 
         self.udps = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udps.settimeout(self.timeout)
         self.get_servers_ips()
 
         # store all latencies of the requests sent (used for evaluation)
@@ -105,7 +109,7 @@ class NetCacheClient:
     def read(self, key, seq=0, suppress=False):
         msg = build_message(NETCACHE_READ_QUERY, key, seq)
         if msg is None:
-            return
+            return False
 
         start_time = time.time()
 
@@ -123,15 +127,17 @@ class NetCacheClient:
 
         if op == NETCACHE_KEY_NOT_FOUND:
             print('Error: Key not found (key = ' + key + ')')
+            return False
         else:
-            val = data[21:].decode("utf-8")
+            val = data[21:].decode("utf-8").strip("\x00")
             print(val)
+            return True
 
 
     def put(self, key, value, seq = 0, proto='udp'):
         msg = build_message(NETCACHE_WRITE_QUERY, key, seq, value)
         if msg is None:
-            return
+            return False
 
         if proto == 'udp':
             start_time = time.time()
@@ -143,11 +149,14 @@ class NetCacheClient:
 
             if status[0] == NETCACHE_KEY_NOT_FOUND:
                 print('Error: Key not found (key = ' + key + ')')
+                return False
 
             self.latencies.append(latency)
+            return True
 
         elif proto == 'tcp':
             tcps = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            tcps.settimeout(self.timeout)
             tcps.connect((self.get_node(key), self.port))
 
             start_time = time.time()
@@ -160,11 +169,14 @@ class NetCacheClient:
 
             if status[0] == NETCACHE_KEY_NOT_FOUND:
                 print('Error: Key not found (key = ' + key + ')')
+                return False
 
             tcps.close()
+            return True
 
         else:
             print('Protocol for write (' + proto + ') unsupported')
+            return False
 
 
     def delete(self, key, seq = 0):
@@ -173,6 +185,7 @@ class NetCacheClient:
             return
 
         tcps = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tcps.settimeout(self.timeout)
         tcps.connect((self.get_node(key), self.port))
 
         start_time = time.time()

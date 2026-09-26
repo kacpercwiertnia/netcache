@@ -1,0 +1,18 @@
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/netcache/kv_store
+ENV NETCACHE_CLIENT_OP=read
+ENV NETCACHE_CLIENT_KEYS=one,two,three
+ENV NETCACHE_CLIENT_VALUE=netcache-client-value
+ENV NETCACHE_CLIENT_SERVERS=1
+ENV NETCACHE_CLIENT_DISABLE_CACHE=false
+
+WORKDIR /netcache
+
+COPY src/kv_store /netcache/kv_store
+COPY docker/client-entrypoint.py /usr/local/bin/netcache-client
+
+RUN chmod +x /usr/local/bin/netcache-client
+
+ENTRYPOINT ["netcache-client"]

@@ -157,6 +157,8 @@ control MyIngress(inout headers hdr,
 
 	}
 
+	counter(1, CounterType.packets) cache_hit_cnt;
+	counter(1, CounterType.packets) cache_miss_cnt;
 
     // register storing a bit to indicate whether an element in the cache
     // is valid or invalid
@@ -440,6 +442,11 @@ control MyIngress(inout headers hdr,
 						// read query should be answered by switch if the key
 						// resides in cache and its entry is valid
 						meta.cache_valid = (cache_valid_bit == 1);
+						if (meta.cache_valid) {
+							cache_hit_cnt.count((bit<32>) 0);
+						} else {
+							cache_miss_cnt.count((bit<32>) 0);
+						}
 
 						/*
 						if(meta.cache_valid && hdr.udp.srcPort != NETCACHE_PORT) {
@@ -573,7 +580,9 @@ control MyIngress(inout headers hdr,
 
 				NoAction: {
 
-					if (hdr.netcache.op == HOT_READ_QUERY) {
+					if (hdr.netcache.op == READ_QUERY) {
+						cache_miss_cnt.count((bit<32>) 0);
+					} else if (hdr.netcache.op == HOT_READ_QUERY) {
 
 						// inform the controller for the hot key to insert to cache
 						if (pkt_is_not_mirrored) {
