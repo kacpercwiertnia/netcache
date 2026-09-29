@@ -24,6 +24,21 @@ def csv_values(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def workload_entries(args: argparse.Namespace) -> list[dict[str, str]]:
+    raw = json.loads(args.entries) if args.entries else None
+    if raw is None:
+        return [{"key": key, "value": args.value} for key in args.keys]
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("Client entries must be a non-empty list")
+    return [{"key": str(entry["key"]), "value": str(entry["value"])} for entry in raw]
+
+
+def value_for_key(args, key):
+    if not hasattr(args, "entry_values"):
+        args.entry_values = {entry["key"]: entry["value"] for entry in workload_entries(args)}
+    return args.entry_values[key]
+
+
 def control_entries(args: argparse.Namespace) -> list[dict[str, str]]:
     if args.control_entries:
         raw = json.loads(args.control_entries)
@@ -33,7 +48,7 @@ def control_entries(args: argparse.Namespace) -> list[dict[str, str]]:
             {"key": str(item["key"]), "value": str(item["value"])}
             for item in raw
         ]
-    return [{"key": key, "value": args.value} for key in args.keys]
+    return workload_entries(args)
 
 
 def install_control_entries(args: argparse.Namespace) -> None:
@@ -76,7 +91,7 @@ def prime_backend_entries(args: argparse.Namespace, client: NetCacheClient) -> i
     failures = 0
     for key in args.keys:
         print(f"[netcache-client] prime backend key={key}")
-        if not client.put(key, args.value):
+        if not client.put(key, value_for_key(args, key)):
             failures += 1
     return failures
 
@@ -159,6 +174,9 @@ class RedisClient:
 
 def run_redis_client(args: argparse.Namespace) -> int:
     client = RedisClient(args.redis_host, args.redis_port, retries=args.redis_retries)
+    if args.op == "read":
+        for entry in workload_entries(args):
+            client.put(entry["key"], entry["value"])
 
     for iteration in range(args.repeat):
         for key in args.keys:
@@ -167,13 +185,13 @@ def run_redis_client(args: argparse.Namespace) -> int:
                 client.read(key)
             elif args.op == "put":
                 print(f"[redis-client] put key={key} iteration={iteration + 1}")
-                client.put(key, args.value)
+                client.put(key, value_for_key(args, key))
             elif args.op == "delete":
                 print(f"[redis-client] delete key={key} iteration={iteration + 1}")
                 client.delete(key)
             elif args.op == "put-read":
                 print(f"[redis-client] put-read key={key} iteration={iteration + 1}")
-                client.put(key, args.value)
+                client.put(key, value_for_key(args, key))
                 client.read(key)
             else:
                 print(f"Unsupported Redis operation: {args.op}", file=sys.stderr)
@@ -198,14 +216,14 @@ def run_client(args: argparse.Namespace) -> int:
                     failures += 1
             elif args.op == "put":
                 print(f"[netcache-client] put key={key} iteration={iteration + 1}")
-                if not client.put(key, args.value):
+                if not client.put(key, value_for_key(args, key)):
                     failures += 1
             elif args.op == "delete":
                 print(f"[netcache-client] delete key={key} iteration={iteration + 1}")
                 client.delete(key)
             elif args.op == "put-read":
                 print(f"[netcache-client] put-read key={key} iteration={iteration + 1}")
-                if not client.put(key, args.value):
+                if not client.put(key, value_for_key(args, key)):
                     failures += 1
                 if not client.read(key):
                     failures += 1
@@ -305,7 +323,9 @@ def main() -> int:
         type=int,
         default=int(os.environ.get("REDIS_RETRIES", "12")),
     )
+    parser.add_argument("--entries", default=os.environ.get("NETCACHE_CLIENT_ENTRIES", ""))
     args = parser.parse_args()
+    args.keys = [entry["key"] for entry in workload_entries(args)]
     if args.backend == "redis":
         return run_redis_client(args)
     return run_client(args)
